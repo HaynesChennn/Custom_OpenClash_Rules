@@ -2,23 +2,24 @@ import sys
 import subprocess
 import pyperclip
 import tldextract
-import pygetwindow as gw
 import socket
 import geoip2.database
 import requests
 import tempfile
 import os
 import json
-import base64
+import time
+import platform
 import dns.message
 from datetime import datetime
 from urllib.parse import urlencode
 import urllib3
 from dns import rdatatype  # 添加在文件开头的导入部分
-
+import threading
+from queue import Queue
+import base64
 # 禁用SSL警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # 新增：IPv4地址验证函数
 def is_valid_ipv4(address):
     """严格验证IPv4地址格式"""
@@ -27,19 +28,25 @@ def is_valid_ipv4(address):
         return True
     except (socket.error, OSError):
         return False
-
 # 检查并安装依赖（已修复）
+# 新增元信息声明
+__version__ = "3.1"
+__author__ = "Aethersailor"
+__license__ = "CC BY-NC-SA 4.0"
+__repository__ = "https://github.com/Aethersailor/Custom_OpenClash_Rules"
+
+# 原有依赖检查函数
 def check_dependencies():
     required = {
-        'pyperclip': 'pyperclip',
-        'tldextract': 'tldextract',
-        'pygetwindow': 'pygetwindow',
-        'geoip2': 'geoip2',
-        'requests': 'requests',
-        'pyautogui': 'pyautogui',
-        'dns': 'dnspython'
+        'pyperclip': 'pyperclip', 
+        'tldextract': 'tldextract',  # ✅ 用于域名解析
+        'geoip2': 'geoip2',          # ✅ IP地理定位
+        'requests': 'requests',      # ✅ HTTP请求
+        'dns': 'dnspython'           # ✅ DNS解析
+        # 已移除：
+        # 'pygetwindow': 'pygetwindow', 
+        # 'pyautogui': 'pyautogui'
     }
-    
     missing = []
     for pkg in required:
         try:
@@ -49,15 +56,20 @@ def check_dependencies():
     
     if missing:
         print("\n正在安装缺失依赖...")
-        subprocess.check_call(
-            [sys.executable, '-m', 'pip', 'install', *missing],
-            stdout=subprocess.DEVNULL
-        )
+        try:
+            subprocess.check_call(
+                [sys.executable, '-m', 'pip', 'install', *missing],
+                stdout=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print_status(STYLES['error'], f"依赖安装失败: {str(e)}")
+            input("按回车键退出...")
+            sys.exit(1)
+            
         print("依赖安装完成，请重新运行脚本\n")
+        input("按回车键退出...")  # 新增等待
         sys.exit(1)
-
 check_dependencies()
-
 # 颜色定义
 COLORS = {
     "reset": "\033[0m",
@@ -68,16 +80,15 @@ COLORS = {
     "bold": "\033[1m",
     "underline": "\033[4m"
 }
-
+# 修改输出样式定义（移除divider）
 STYLES = {
     "info": f"{COLORS['cyan']}ℹ️  INFO{COLORS['reset']}",
     "success": f"{COLORS['green']}✅ SUCCESS{COLORS['reset']}",
-    "warning": f"{COLORS['yellow']}⚠️  WARNING{COLORS['reset']}",
+    "warning": f"{COLORS['yellow']}⚠️  WARN {COLORS['reset']}", 
     "error": f"{COLORS['red']}❌ ERROR{COLORS['reset']}",
-    "title": f"{COLORS['bold']}{COLORS['cyan']}",
-    "divider": f"{COLORS['cyan']}{'='*60}{COLORS['reset']}"
+    "title": f"{COLORS['bold']}{COLORS['cyan']}✨ {COLORS['underline']}"
+    # 移除divider样式定义
 }
-
 NON_CHINA_PROVIDERS = [
     'cloudflare', 'aws', 'google', 'cloudns.net', 'gandi', 
     'dnsowl', 'domaincontrol', 'he.net', 'name.com', 'azure',
@@ -85,7 +96,6 @@ NON_CHINA_PROVIDERS = [
     'registrar-servers', 'foundationdns.org', 'fastly', 'akamai', 'incapsula',
     'vercel-dns.com'
 ]
-
 DOH_SERVERS = [
     {
         'host': 'dns.alidns.com',
@@ -103,13 +113,14 @@ DOH_SERVERS = [
         'params_type': 'standard'
     }
 ]
-
 DOH_HEADERS = {
     'accept': 'application/dns-json'
 }
-
-GEOIP_DB_URL = 'https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-Country.mmdb'
-
+# 修改GEOIP数据库下载地址配置
+GEOIP_DB_URLS = [
+    'https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-Country.mmdb',
+    'https://github.boki.moe/https://raw.githubusercontent.com/Loyalsoldier/geoip/release/GeoLite2-Country.mmdb'
+]
 def resolve_doh_ip(domain):
     """使用223.5.5.5解析DoH服务器地址（强制IPv4）"""
     try:
@@ -131,7 +142,6 @@ def resolve_doh_ip(domain):
     except subprocess.CalledProcessError as e:
         print_status(STYLES['error'], f"解析失败 {domain}: {e.stderr}")
         return None
-
 def query_ns_with_doh(domain):
     """使用DNS-over-HTTPS查询NS记录"""
     for server in DOH_SERVERS:
@@ -176,7 +186,6 @@ def query_ns_with_doh(domain):
             
     print_status(STYLES['error'], "所有DoH服务器查询失败")
     return None
-
 def parse_dns_wire(data):
     """解析DNS wire格式响应"""
     msg = dns.message.from_wire(data)
@@ -200,7 +209,6 @@ def parse_dns_wire(data):
                 })
     
     return result
-
 def query_a_with_doh(domain):
     """严格查询IPv4地址"""
     for server in DOH_SERVERS:
@@ -239,7 +247,6 @@ def query_a_with_doh(domain):
         except Exception:
             continue
     return None
-
 def process_doh_response(data):
     """处理DoH响应并提取NS记录"""
     ns_servers = []
@@ -258,19 +265,17 @@ def process_doh_response(data):
                     ns_servers.append(ns_data.rstrip('.').lower())
     
     return list(set(ns_servers)) if ns_servers else None
-
 def print_section(title):
-    print(f"\n{STYLES['divider']}")
+    # 移除divider样式引用，改用固定分隔线
+    divider = "═" * 60
+    print(f"\n{COLORS['cyan']}{divider}{COLORS['reset']}")
     print(f"{STYLES['title']}{title.upper()}{COLORS['reset']}")
-    print(f"{STYLES['divider']}\n")
-
+    print(f"{COLORS['cyan']}{divider}{COLORS['reset']}\n")
 def print_status(style, message):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {style}: {message}")
-
 def extract_domain(url):
     ext = tldextract.extract(url)
     return f"{ext.domain}.{ext.suffix}"
-
 def get_ip_from_ns(ns_domain):
     """双重验证获取IPv4地址"""
     print_status(STYLES['info'], f"开始解析NS服务器: {ns_domain}")
@@ -295,7 +300,6 @@ def get_ip_from_ns(ns_domain):
     
     print_status(STYLES['error'], f"DNS解析失败 [{ns_domain}]")
     return None
-
 def get_geo_info(ip_address, geoip_db_path):
     try:
         with geoip2.database.Reader(geoip_db_path) as reader:
@@ -303,10 +307,10 @@ def get_geo_info(ip_address, geoip_db_path):
     except Exception as e:
         print_status(STYLES['error'], f"归属地查询失败 [{ip_address}]: {e}")
         return None
-
 def download_geoip_db():
     try:
-        print_section("初始化地理数据库")
+        # 移除旧的分隔线打印方式
+        print_status(STYLES['info'], "初始化地理数据库")
         temp_dir = tempfile.gettempdir()
         geoip_db_path = os.path.join(temp_dir, 'GeoLite2-Country.mmdb')
         
@@ -314,31 +318,39 @@ def download_geoip_db():
             os.remove(geoip_db_path)
             print_status(STYLES['info'], "已清理旧版地理数据库")
 
-        print_status(STYLES['info'], "开始下载最新地理数据库...")
-        response = requests.get(GEOIP_DB_URL, stream=True)
-        response.raise_for_status()
-
-        total_size = int(response.headers.get('content-length', 0))
-        with open(geoip_db_path, 'wb') as f:
-            downloaded = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded += len(chunk)
-                progress = downloaded / total_size * 100 if total_size > 0 else 100
-                print(f"\r下载进度: {progress:.1f}%", end='')
-        print("\n")
-        return geoip_db_path
+        # 新增备用下载逻辑
+        for db_url in GEOIP_DB_URLS:
+            print_status(STYLES['info'], f"尝试下载: {db_url}")
+            try:
+                response = requests.get(db_url, stream=True)
+                response.raise_for_status()
+                
+                total_size = int(response.headers.get('content-length', 0))
+                with open(geoip_db_path, 'wb') as f:
+                    downloaded = 0
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        progress = downloaded / total_size * 100 if total_size > 0 else 100
+                        print(f"\r下载进度: {progress:.1f}%", end='')
+                print("\n")
+                return geoip_db_path
+            except Exception as e:
+                print_status(STYLES['warning'], f"下载失败: {str(e)}，尝试备用地址...")
+                continue
+                
+        print_status(STYLES['error'], "所有下载地址均不可用")
+        return None
     except Exception as e:
         print_status(STYLES['error'], f"数据库下载失败: {e}")
         return None
-
 def check_non_china_provider(ns_domain):
     return any(provider in ns_domain.lower() for provider in NON_CHINA_PROVIDERS)
-
 def validate_ns_records(new_domain, geoip_db_path):
-    print_section("域名验证流程")
-    print_status(STYLES['info'], f"开始验证域名: {new_domain}")
+    # 移除硬编码的分隔线打印
+    print_status(STYLES['info'], "开始域名验证流程")
     
+    print_status(STYLES['info'], f"开始验证域名: {new_domain}")
     ns_servers = query_ns_with_doh(new_domain)
     
     if not ns_servers:
@@ -367,7 +379,6 @@ def validate_ns_records(new_domain, geoip_db_path):
         print_status(STYLES['success'], f"验证通过: {ip_address} ({country})")
     
     return True
-
 def check_existing_entry(file_path, new_domain):
     entry = f"server=/{new_domain}/114.114.114.114"
     try:
@@ -376,7 +387,6 @@ def check_existing_entry(file_path, new_domain):
     except Exception as e:
         print_status(STYLES['error'], f"文件读取失败: {e}")
         return True
-
 def find_insert_position(lines, new_domain):
     new_entry = f"server=/{new_domain}/114.114.114.114"
     for i, line in enumerate(lines):
@@ -386,7 +396,6 @@ def find_insert_position(lines, new_domain):
             if existing_domain > new_domain:
                 return i
     return len(lines)
-
 def get_config_path():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     target_dir = os.path.join(script_dir, "dnsmasq-china-list")
@@ -403,90 +412,178 @@ def get_config_path():
         return None
     
     return config_path
-
 def insert_domain():
+    # 在文件顶部添加导入（约第10行）
+    import threading
+    from queue import Queue
     print_section("dnsmasq-china-list 域名规则管理工具启动")
-    print(f"{STYLES['title']}版本: 3.1 | 作者: Aethersailor | 协议: MIT{COLORS['reset']}\n")
+    print(f"{STYLES['title']}版本: {__version__} | 作者: {__author__} | 协议: {__license__}")
+    print(f"{STYLES['title']}仓库: {__repository__}{COLORS['reset']}\n")
     
+    # 新增剪贴板初始化清理
+    try:
+        pyperclip.copy("")  # 清空剪贴板
+        print_status(STYLES['info'], "已初始化剪贴板缓冲区")
+    except Exception as e:
+        print_status(STYLES['warning'], f"剪贴板清空失败，请手动清空剪贴板后继续: {str(e)}")
+
     config_path = get_config_path()
     if not config_path:
         return
-
+    
     geoip_db_path = download_geoip_db()
     if not geoip_db_path:
         return
 
+    # 新增剪贴板监控相关变量
+    processing_queue = Queue()
+    last_clipboard_content = None
+    processed_history = set()
+    clipboard_lock = threading.Lock()
+
+    def process_domain(domain):
+        """核心处理逻辑"""
+        try:
+            # 移除这里的print_section调用
+            # 调整顺序：先检查存在性
+            if check_existing_entry(config_path, domain):
+                print_status(STYLES['warning'], f"已存在记录: {domain}")
+                return
+    
+            # 存在性检查通过后再执行验证
+            if not validate_ns_records(domain, geoip_db_path):
+                print_status(STYLES['error'], f"验证失败: {domain}")
+                return
+    
+            with open(config_path, 'r+', encoding='utf-8') as f:
+                lines = f.readlines()
+                if any(f"server=/{domain}/" in line for line in lines):
+                    print_status(STYLES['warning'], f"重复记录: {domain}")
+                    return
+    
+                insert_pos = find_insert_position(lines, domain)
+                lines.insert(insert_pos, f"server=/{domain}/114.114.114.114\n")
+                f.seek(0)
+                f.writelines(lines)
+    
+            print_status(STYLES['success'], f"成功添加: {domain}")
+            pyperclip.copy("")  # 清空剪贴板
+            
+            # ======== 修改后的git提交逻辑 ========
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            target_dir = os.path.join(script_dir, "dnsmasq-china-list")
+            
+            try:
+                os.chdir(target_dir)
+                subprocess.run(['git', 'add', 'accelerated-domains.china.conf'], check=True)
+                commit_msg = f"accelerated-domains: add {domain}"
+                subprocess.run(['git', 'commit', '-m', commit_msg], check=True)
+                print_status(STYLES['success'], "已提交更改到本地仓库")  # 修改提示信息
+            except subprocess.CalledProcessError as e:
+                print_status(STYLES['warning'], f"Git提交失败: {str(e)}")
+            finally:
+                os.chdir(script_dir)
+            # ======== 修改结束 ========
+                
+        except Exception as e:
+            print_status(STYLES['error'], f"处理异常: {str(e)}")
+            raise
+
+    # 新增：将包装函数定义移动到insert_domain作用域内
+    def process_domain_wrapper(domain):
+        """带错误处理的任务包装器"""
+        try:
+            print_section(f"域名处理中: {domain}")
+            process_domain(domain)
+        except Exception as e:
+            print_status(STYLES['error'], f"处理失败: {str(e)}")
+
+    def clipboard_monitor():
+        """剪贴板监控线程"""
+        nonlocal last_clipboard_content
+        while True:
+            try:
+                with clipboard_lock:
+                    current_content = pyperclip.paste().strip(' "\'')
+                    
+                if current_content:
+                    # 新增内容变化检测
+                    if current_content == last_clipboard_content:
+                        time.sleep(0.5)
+                        continue
+                        
+                    domain = extract_domain(current_content)
+                    # 调整检测顺序
+                    if domain in processed_history:
+                        print_status(STYLES['warning'], f"检测到历史域名: {domain}")
+                        last_clipboard_content = current_content  # 更新最后内容防止重复
+                        continue
+                    if domain.endswith('.cn'):
+                        print_status(STYLES['warning'], f"已忽略.cn域名: {domain}")
+                        last_clipboard_content = current_content  # 新增：更新最后内容
+                        continue
+                        
+                    processing_queue.put(domain)
+                    processed_history.add(domain)
+                    last_clipboard_content = current_content
+                    print_status(STYLES['success'], f"已加入队列: {domain}")
+                    
+                time.sleep(0.5)
+            except Exception as e:  # 捕获剪贴板访问异常
+                print_status(STYLES['error'], f"剪贴板监控异常: {str(e)}")
+                time.sleep(1)
+
+    # 启动监控线程
+    monitor_thread = threading.Thread(target=clipboard_monitor, daemon=True)
+    monitor_thread.start()
+
+    print_status(STYLES['info'], "剪贴板监控已启动 (自动忽略.cn域名)")
+    print_status(STYLES['info'], "检测到新域名将自动加入处理队列")
+
+    # 主处理循环
     while True:
         try:
-            user_input = input(f"\n{COLORS['cyan']}请输入域名/URL（或输入 exit 退出）{COLORS['reset']}: ").strip()
-            
-            if user_input.lower() == 'exit':
-                print_section("程序退出")
-                print_status(STYLES['info'], "感谢使用！")
-                break
-
-            new_domain = extract_domain(user_input)
-            if new_domain.endswith('.cn'):
-                print_status(STYLES['warning'], ".cn域名自动跳过")
-                continue
+            if not processing_queue.empty():
+                domain = processing_queue.get()
+                # 移除此处的print_section调用
                 
-            if check_existing_entry(config_path, new_domain):
-                print_status(STYLES['warning'], "规则已存在，跳过处理")
-                continue
+                # 启动独立线程处理任务
+                processing_thread = threading.Thread(
+                    target=process_domain_wrapper,
+                    args=(domain,)
+                )
+                processing_thread.start()
+                processing_thread.join()  # 等待当前任务完成
                 
-            if validate_ns_records(new_domain, geoip_db_path):
-                # 原子化写入：分离读/写操作，确保文件完整性
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    lines = f.readlines()
-                
-                new_entry = f"server=/{new_domain}/114.114.114.114\n"
-                insert_pos = find_insert_position(lines, new_domain)
-                lines.insert(insert_pos, new_entry)
-                
-                # 使用换行符保持文件格式统一
-                with open(config_path, 'w', newline='\n', encoding='utf-8') as f:
-                    f.writelines(lines)
-                
-                # 新增写入验证
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    written_content = f.read()
-                    if new_entry.strip() not in written_content:
-                        raise RuntimeError(f"文件写入验证失败: {new_entry.strip()}")
-                
-                # 新增git操作
-                target_dir = os.path.dirname(config_path)
-                commit_msg = f"accelerated-domains: {new_domain}"
-                
-                try:
-                    # 执行git命令
-                    subprocess.run(
-                        ['git', 'add', 'accelerated-domains.china.conf'],
-                        cwd=target_dir,
-                        check=True
-                    )
-                    subprocess.run(
-                        ['git', 'commit', '-m', commit_msg],
-                        cwd=target_dir,
-                        check=True
-                    )
-                    print_status(STYLES['success'], "成功提交到Git仓库")
-                except subprocess.CalledProcessError as e:
-                    print_status(STYLES['error'], f"Git操作失败: {str(e)}")
-                except Exception as e:
-                    print_status(STYLES['error'], f"意外错误: {str(e)}")
+                # 清理历史记录避免内存泄漏
+                if len(processed_history) > 100:
+                    processed_history.clear()
             else:
-                print_status(STYLES['error'], "域名验证未通过，跳过添加")
+                time.sleep(1)
                 
         except KeyboardInterrupt:
             print_status(STYLES['error'], "操作已中止")
             break
 
+# 修复1：移除文件末尾的重复 main 代码块（删除以下部分）
 if __name__ == "__main__":
     try:
         insert_domain()
+        # 保持主线程存活
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print_status(STYLES['error'], "\n程序已终止")
     except Exception as e:
-        print(f"\n{STYLES['error']}: 发生未捕获异常")
+        print(f"\n{STYLES['error']}: 致命错误 - {str(e)}")
         import traceback
         traceback.print_exc()
     finally:
-        input("\n按回车键退出...")
+        if sys.platform.startswith('win'):
+            import msvcrt
+            print("\n按任意键退出...")
+            msvcrt.getch()
+        else:
+            print("\n按回车键退出...")
+            sys.stdin.read(1)
+
